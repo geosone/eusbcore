@@ -17,7 +17,7 @@ Class drivers on top of it:
 
 ## Use
 
-The embedding system implements OpenASPI's host services, adds its controllers with `usb_add()` (EHCI before its companions), calls `usb_enumerate()` and hands the devices (`usb_device_count()`, `usb_device()`) to the class drivers, which use `usb_control()` and `usb_transfer()`.
+The embedding system implements OpenASPI's host services, adds its controllers with `usb_add()` (EHCI before its companions), calls `usb_enumerate()` and hands the devices (`usb_device_count()`, `usb_device()`) to the class drivers, which use `usb_control()` and `usb_transfer()` (blocking) and, for HID reports, interrupt pipes that never wait: `usb_intr_open()` keeps a transfer armed, `usb_intr_poll()` returns a report once one has arrived. xHCI keeps the TRB on the endpoint ring, EHCI and UHCI put a queue head into the periodic schedule (EHCI with split transactions behind a high-speed hub), OHCI an ED into all interrupt lists; every frame is polled.
 
 CMake builds it as `EUSBCORE::core` on top of `OpenASPI::host`; a parent project provides that target, otherwise `OPENASPI_SOURCE_DIR` or an OpenASPI checkout next to this one is used:
 
@@ -27,7 +27,7 @@ cmake -S . -B build -G Ninja && ninja -C build
 
 Class drivers include eusbcore as a submodule and use the parent's `EUSBCORE::core` when there is one, so a system with several class drivers builds the core once.
 
-Tested in QEMU on x86-64, i686 and AArch64 through GDOS: xHCI (super speed, a hub), EHCI, OHCI, UHCI and an EHCI with UHCI companions and a full-speed hub.
+Tested in QEMU on x86-64, i686 and AArch64 through GDOS: xHCI (super speed, a hub), EHCI, OHCI, UHCI and an EHCI with UHCI companions and a full-speed hub, with mass storage (reading, writing) and keyboards and mice (interrupt pipes). Split interrupt transactions behind a high-speed hub are untested: QEMU has no high-speed hub.
 
 ## License
 
