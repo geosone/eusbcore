@@ -25,12 +25,15 @@
 #define OP_USBSTS  0x04u
 #define OP_USBINTR 0x08u
 #define OP_CTRLDS  0x10u
+#define OP_FRINDEX 0x0Cu
+#define OP_PERIODIC 0x14u
 #define OP_ASYNC   0x18u
 #define OP_CONFIG  0x40u
 #define OP_PORTSC  0x44u
 
 #define CMD_RS    0x01u
 #define CMD_RESET 0x02u
+#define CMD_PSE   0x10u
 #define CMD_ASE   0x20u
 #define STS_HALT  0x1000u
 #define STS_ASS   0x8000u
@@ -84,7 +87,24 @@ struct ehc {
     oa_u64 bounce_bus;
     struct pipe pipes[MAX_QH];
     unsigned npipes;
+    oa_u32 *frames;               /* periodic frame list, 1024 entries */
 };
+
+/* An interrupt IN pipe: a queue head in the periodic schedule (polled in
+ * every frame) with one qTD that is re-armed after each report. */
+struct eintr {
+    volatile struct qh *qh;
+    oa_u64 qh_bus;
+    volatile struct qtd *td;
+    oa_u64 td_bus;
+    oa_u8 *buf;
+    oa_u64 buf_bus;
+    oa_u16 len;
+};
+
+#define MAX_INTR 16
+static struct eintr eintrs[MAX_INTR];
+static unsigned neintrs;
 
 static struct ehc ehcs[MAX_CONTROLLERS];
 static unsigned nehcs;
@@ -379,8 +399,94 @@ static void e_clear_halt(struct usb_hc *hc, struct usb_dev *d, oa_u8 ep)
     }
 }
 
+static void intr_arm(struct eintr *p)
+{
+    unsigned k;
+
+    p->td->next = 1u;
+    p->td->alt = 1u;
+    for (k = 0; k < 5u; k++) {
+        p->td->buf[k] = k == 0u ? (oa_u32)p->buf_bus : 0u;
+        p->td->buf_hi[k] = k == 0u ? (oa_u32)(p->buf_bus >> 32) : 0u;
+    }
+    p->td->token = ((oa_u32)p->len << 16) | (3ul << 10) | (PID_IN << 8) | TOK_ACTIVE;
+    oa_host_mb();
+    p->qh->next = (oa_u32)p->td_bus;
+    oa_host_mb();
+}
+
+static int e_intr_open(struct usb_hc *hc, struct usb_intr *pipe)
+{
+    struct ehc *e = hc->priv;
+    struct usb_dev *d = pipe->dev;
+    struct eintr *p;
+    unsigned eps, i;
+    oa_u32 ch, caps, head;
+
+    if (neintrs == MAX_INTR || e->frames == 0) {
+        return -1;
+    }
+    p = &eintrs[neintrs];
+    p->qh = oa_host_dma_alloc(64, 64, 1, &p->qh_bus);
+    p->td = oa_host_dma_alloc(64, 64, 1, &p->td_bus);
+    p->buf = oa_host_dma_alloc(1024, 64, 1, &p->buf_bus);
+    if (p->qh == 0 || p->td == 0 || p->buf == 0) {
+        return -1;
+    }
+    neintrs++;
+    p->len = pipe->len;
+    eps = d->speed == USB_SPEED_HIGH ? 2u : d->speed == USB_SPEED_LOW ? 1u : 0u;
+    ch = d->addr | ((oa_u32)(pipe->ep & 15u) << 8) | (eps << 12) |
+         ((oa_u32)d->in[pipe->ep & 15u].mps << 16);
+    caps = (1ul << 30) | 0x01u;            /* one packet, start in microframe 0 */
+    if (eps != 2u) {
+        caps |= 0x1Cu << 8;                /* complete splits in microframes 2-4 */
+        if (d->tt_hub) {
+            caps |= ((oa_u32)d->tt_hub->addr << 16) | ((oa_u32)d->tt_port << 23);
+        }
+    }
+    memset((void *)p->qh, 0, 64);
+    memset((void *)p->td, 0, 64);
+    p->qh->ep_char = ch;
+    p->qh->ep_caps = caps;
+    p->qh->alt = 1u;
+    p->qh->next = 1u;
+    head = e->frames[0];
+    p->qh->link = head;                    /* in front of the others */
+    intr_arm(p);
+    for (i = 0; i < 1024u; i++) {
+        e->frames[i] = (oa_u32)p->qh_bus | 2u;
+    }
+    oa_host_mb();
+    pipe->hcpriv = p;
+    return 0;
+}
+
+static int e_intr_poll(struct usb_hc *hc, struct usb_intr *pipe, void *buf, oa_u16 *actual)
+{
+    struct eintr *p = pipe->hcpriv;
+    oa_u32 tok = p->td->token, left;
+
+    (void)hc;
+    if (tok & TOK_ACTIVE) {
+        return 0;
+    }
+    oa_host_mb();
+    if (tok & TOK_ERRORS) {
+        p->qh->token = 0; /* not halted, DATA0 */
+        intr_arm(p);
+        return (tok & TOK_HALTED) && !(tok & 0x3Cu) ? -USB_STALL : -USB_ERROR;
+    }
+    left = (tok >> 16) & 0x7FFFu;
+    *actual = (oa_u16)(left < p->len ? p->len - left : 0u);
+    memcpy(buf, p->buf, *actual);
+    intr_arm(p);
+    return 1;
+}
+
 static const struct usb_hc_ops ehci_ops = {
-    e_ports, e_port_reset, e_address, 0, 0, e_control, e_transfer, e_clear_halt, 0
+    e_ports, e_port_reset, e_address, 0, 0, e_control, e_transfer, e_clear_halt, 0,
+    e_intr_open, e_intr_poll
 };
 
 static void hex(char *out, oa_u32 v, unsigned digits)
@@ -458,8 +564,19 @@ int usb_add_ehci(oa_u32 pci)
     wr(e, OP_USBINTR, 0);
     wr(e, OP_CTRLDS, 0);
     wr(e, OP_ASYNC, (oa_u32)e->head_bus);
+    {
+        oa_u64 fb;
+        e->frames = oa_host_dma_alloc(4096, 4096, 1, &fb);
+        if (e->frames) {
+            for (i = 0; i < 1024u; i++) {
+                e->frames[i] = 1u;
+            }
+            wr(e, OP_FRINDEX, 0);
+            wr(e, OP_PERIODIC, (oa_u32)fb);
+        }
+    }
     oa_host_mb();
-    wr(e, OP_USBCMD, (8ul << 16) | CMD_ASE | CMD_RS);
+    wr(e, OP_USBCMD, (8ul << 16) | CMD_ASE | (e->frames ? CMD_PSE : 0u) | CMD_RS);
     wait_bits(e, OP_USBSTS, STS_HALT, 0, 20);
     wr(e, OP_CONFIG, 1); /* ports to us */
     if (hcs & 0x10u) { /* port power control */

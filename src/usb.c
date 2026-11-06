@@ -79,6 +79,29 @@ int usb_transfer(struct usb_dev *dev, oa_u8 ep, void *data, oa_u32 len, oa_u32 *
     return dev->hc->ops->transfer(dev->hc, dev, ep, data, len, actual, timeout_ms);
 }
 
+int usb_intr_open(struct usb_intr *pipe, struct usb_dev *dev, oa_u8 ep, oa_u16 len)
+{
+    struct usb_hc *hc = dev->hc;
+    const struct usb_ep *e = &dev->in[ep & 15u];
+
+    if (!hc->ops->intr_open || !(ep & 0x80u) || e->mps == 0u || e->type != USB_EP_INTR) {
+        return -1;
+    }
+    pipe->dev = dev;
+    pipe->ep = ep;
+    pipe->len = len < e->mps ? len : e->mps;
+    pipe->hcpriv = 0;
+    return hc->ops->intr_open(hc, pipe);
+}
+
+int usb_intr_poll(struct usb_intr *pipe, void *buf, oa_u16 *actual)
+{
+    struct usb_hc *hc = pipe->dev->hc;
+
+    *actual = 0;
+    return hc->ops->intr_poll(hc, pipe, buf, actual);
+}
+
 int usb_clear_halt(struct usb_dev *dev, oa_u8 ep)
 {
     int r = usb_control(dev, 0x02u, REQ_CLEAR_FEAT, 0, ep, 0, 0, 0);

@@ -62,6 +62,14 @@ struct usb_dev {
     oa_u16 config_len;
 };
 
+/* A polled interrupt IN pipe, see usb_intr_open(). */
+struct usb_intr {
+    struct usb_dev *dev;
+    oa_u8 ep;       /* endpoint address, bit 7 set */
+    oa_u16 len;     /* bytes per report, at most the endpoint's max packet */
+    void *hcpriv;
+};
+
 struct usb_hc_ops {
     /* root hub */
     unsigned (*ports)(struct usb_hc *hc);
@@ -87,6 +95,11 @@ struct usb_hc_ops {
      * controller too (xHCI); the data toggle starts at DATA0 again. */
     void (*clear_halt)(struct usb_hc *hc, struct usb_dev *dev, oa_u8 ep);
     void (*release)(struct usb_hc *hc, struct usb_dev *dev);
+    /* Interrupt IN pipe (HID reports): queue a transfer that stays armed;
+     * intr_poll returns 1 with a report (and re-arms), 0 while nothing has
+     * arrived, a negative USB_* result on an error (re-armed as well). */
+    int (*intr_open)(struct usb_hc *hc, struct usb_intr *pipe);
+    int (*intr_poll)(struct usb_hc *hc, struct usb_intr *pipe, void *buf, oa_u16 *actual);
 };
 
 struct usb_hc {
@@ -113,6 +126,13 @@ int usb_control(struct usb_dev *dev, oa_u8 type, oa_u8 req, oa_u16 value, oa_u16
                 void *data, oa_u16 len, oa_u16 *actual);
 int usb_transfer(struct usb_dev *dev, oa_u8 ep, void *data, oa_u32 len, oa_u32 *actual,
                  oa_u32 timeout_ms);
+/* Open an interrupt IN pipe on endpoint `ep` of `dev` for reports of up to
+ * `len` bytes; 0, or -1 when the controller has no room or no support.
+ * usb_intr_poll() never waits: 1 and the report in buf (*actual bytes), 0
+ * when none has arrived, -USB_STALL/-USB_ERROR after an error. */
+int usb_intr_open(struct usb_intr *pipe, struct usb_dev *dev, oa_u8 ep, oa_u16 len);
+int usb_intr_poll(struct usb_intr *pipe, void *buf, oa_u16 *actual);
+
 /* CLEAR_FEATURE(ENDPOINT_HALT) and the controller side of it. */
 int usb_clear_halt(struct usb_dev *dev, oa_u8 ep);
 

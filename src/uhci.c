@@ -63,7 +63,27 @@ struct uhc {
     oa_u64 td_bus;
     oa_u8 *bounce;
     oa_u64 bounce_bus;
+    oa_u32 *frames;
 };
+
+/* An interrupt IN pipe: a queue head in every frame, in front of the
+ * control/bulk queue head, with one TD re-armed after each report. */
+struct uintr {
+    volatile oa_u32 *qh;
+    oa_u64 qh_bus;
+    volatile struct td *td;
+    oa_u64 td_bus;
+    oa_u8 *buf;
+    oa_u64 buf_bus;
+    oa_u16 len;
+    struct usb_ep *ep;
+    int low;
+    oa_u32 token;     /* without the toggle */
+};
+
+#define MAX_INTR 16
+static struct uintr uintrs[MAX_INTR];
+static unsigned nuintrs;
 
 static struct uhc uhcs[MAX_CONTROLLERS];
 static unsigned nuhcs;
@@ -269,8 +289,81 @@ static int u_transfer(struct usb_hc *hc, struct usb_dev *d, oa_u8 ep, void *data
     return r;
 }
 
+static void intr_arm(struct uintr *p)
+{
+    p->td->link = 1u;
+    p->td->buf = (oa_u32)p->buf_bus;
+    p->td->token = p->token | ((oa_u32)p->ep->toggle << 19);
+    oa_host_mb();
+    p->td->cs = TD_ACTIVE | TD_SPD | (3ul << 27) | (p->low ? TD_LS : 0u);
+    oa_host_mb();
+    p->qh[1] = (oa_u32)p->td_bus;
+    oa_host_mb();
+}
+
+static int u_intr_open(struct usb_hc *hc, struct usb_intr *pipe)
+{
+    struct uhc *u = hc->priv;
+    struct usb_dev *d = pipe->dev;
+    struct uintr *p;
+    unsigned i;
+
+    if (nuintrs == MAX_INTR || u->frames == 0) {
+        return -1;
+    }
+    p = &uintrs[nuintrs];
+    p->qh = oa_host_dma_alloc(16, 16, 1, &p->qh_bus);
+    p->td = oa_host_dma_alloc(16, 16, 1, &p->td_bus);
+    p->buf = oa_host_dma_alloc(1024, 64, 1, &p->buf_bus);
+    if (p->qh == 0 || p->td == 0 || p->buf == 0) {
+        return -1;
+    }
+    nuintrs++;
+    p->len = pipe->len;
+    p->ep = &d->in[pipe->ep & 15u];
+    p->low = d->speed == USB_SPEED_LOW;
+    p->token = PID_IN | ((oa_u32)d->addr << 8) | ((oa_u32)(pipe->ep & 15u) << 15) |
+               ((oa_u32)(p->len - 1u) << 21);
+    p->qh[0] = u->frames[0];               /* on to the others */
+    intr_arm(p);
+    for (i = 0; i < 1024u; i++) {
+        u->frames[i] = (oa_u32)p->qh_bus | 2u;
+    }
+    oa_host_mb();
+    pipe->hcpriv = p;
+    return 0;
+}
+
+static int u_intr_poll(struct usb_hc *hc, struct usb_intr *pipe, void *buf, oa_u16 *actual)
+{
+    struct uintr *p = pipe->hcpriv;
+    oa_u32 cs = p->td->cs, got;
+
+    (void)hc;
+    if (cs & TD_ACTIVE) {
+        return 0;
+    }
+    oa_host_mb();
+    if (cs & TD_ERRORS) {
+        if (cs & TD_STALLED) {
+            p->ep->toggle = 0;
+        }
+        intr_arm(p);
+        return (cs & TD_STALLED) ? -USB_STALL : -USB_ERROR;
+    }
+    got = (cs + 1u) & 0x7FFu;
+    if (got > p->len) {
+        got = 0; /* null packet (7FFh) */
+    }
+    p->ep->toggle ^= 1u;
+    *actual = (oa_u16)got;
+    memcpy(buf, p->buf, got);
+    intr_arm(p);
+    return 1;
+}
+
 static const struct usb_hc_ops uhci_ops = {
-    u_ports, u_port_reset, u_address, 0, 0, u_control, u_transfer, 0, 0
+    u_ports, u_port_reset, u_address, 0, 0, u_control, u_transfer, 0, 0, u_intr_open, u_intr_poll
 };
 
 static void hex(char *out, oa_u32 v, unsigned digits)
@@ -323,6 +416,7 @@ int usb_add_uhci(oa_u32 pci)
     if (fl == 0 || u->qh == 0 || u->td == 0 || u->bounce == 0) {
         return -1;
     }
+    u->frames = fl;
     u->qh[0] = 1u; /* no next queue head */
     u->qh[1] = 1u; /* empty */
     for (i = 0; i < 1024u; i++) {

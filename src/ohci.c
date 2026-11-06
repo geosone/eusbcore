@@ -34,6 +34,7 @@
 #define HC_RHSTATUS  0x50u
 #define HC_RHPORT    0x54u
 
+#define CTL_PLE  0x04u
 #define CTL_CLE  0x10u
 #define CTL_BLE  0x20u
 #define CTL_HCFS 0xC0u
@@ -85,7 +86,24 @@ struct ohc {
     struct pipe pipes[MAX_ED];
     unsigned npipes;
     volatile struct ed *ctrl_last, *bulk_last;
+    volatile oa_u32 *hcca;      /* interrupt table: entries 0-31 */
 };
+
+/* An interrupt IN pipe: an ED in all 32 interrupt lists (polled in every
+ * frame) with one TD before the dummy tail, re-armed after each report. */
+struct ointr {
+    volatile struct ed *ed;
+    oa_u64 ed_bus;
+    volatile struct td *td;     /* td[0], dummy tail td[1] */
+    oa_u64 td_bus;
+    oa_u8 *buf;
+    oa_u64 buf_bus;
+    oa_u16 len;
+};
+
+#define MAX_INTR 16
+static struct ointr ointrs[MAX_INTR];
+static unsigned nointrs;
 
 static struct ohc ohcs[MAX_CONTROLLERS];
 static unsigned nohcs;
@@ -332,8 +350,83 @@ static void o_clear_halt(struct usb_hc *hc, struct usb_dev *d, oa_u8 ep)
     }
 }
 
+static void intr_arm(struct ointr *p)
+{
+    volatile struct td *t = &p->td[0];
+    oa_u64 tail = p->td_bus + 16u;
+
+    /* IN, rounding, no interrupt, toggle from the ED */
+    t->info = (1ul << 18) | ((oa_u32)TD_IN << 19) | (7ul << 21) | ((oa_u32)CC_NOTACCESSED << 28);
+    t->cbp = (oa_u32)p->buf_bus;
+    t->be = (oa_u32)(p->buf_bus + p->len - 1u);
+    t->next = (oa_u32)tail;
+    p->ed->tail = (oa_u32)tail;
+    oa_host_mb();
+    p->ed->head = (oa_u32)p->td_bus | (p->ed->head & 2u);
+    oa_host_mb();
+}
+
+static int o_intr_open(struct usb_hc *hc, struct usb_intr *pipe)
+{
+    struct ohc *o = hc->priv;
+    struct usb_dev *d = pipe->dev;
+    struct ointr *p;
+    unsigned i;
+
+    if (nointrs == MAX_INTR) {
+        return -1;
+    }
+    p = &ointrs[nointrs];
+    p->ed = oa_host_dma_alloc(16, 16, 1, &p->ed_bus);
+    p->td = oa_host_dma_alloc(32, 16, 1, &p->td_bus);
+    p->buf = oa_host_dma_alloc(1024, 64, 1, &p->buf_bus);
+    if (p->ed == 0 || p->td == 0 || p->buf == 0) {
+        return -1;
+    }
+    nointrs++;
+    p->len = pipe->len;
+    memset((void *)p->td, 0, 32);
+    p->ed->info = d->addr | ((oa_u32)(pipe->ep & 15u) << 7) | (2ul << 11) /* IN */ |
+                  (d->speed == USB_SPEED_LOW ? (1ul << 13) : 0u) |
+                  ((oa_u32)d->in[pipe->ep & 15u].mps << 16);
+    p->ed->head = 0;
+    p->ed->next = o->hcca[0];
+    intr_arm(p);
+    for (i = 0; i < 32u; i++) {
+        o->hcca[i] = (oa_u32)p->ed_bus;
+    }
+    oa_host_mb();
+    wr(o, HC_CONTROL, rd(o, HC_CONTROL) | CTL_PLE);
+    pipe->hcpriv = p;
+    return 0;
+}
+
+static int o_intr_poll(struct usb_hc *hc, struct usb_intr *pipe, void *buf, oa_u16 *actual)
+{
+    struct ointr *p = pipe->hcpriv;
+    oa_u32 head = p->ed->head, cc, cbp;
+
+    (void)hc;
+    if ((head & ~0xFul) != (oa_u32)(p->td_bus + 16u) && !(head & 1u)) {
+        return 0;
+    }
+    oa_host_mb();
+    cc = p->td[0].info >> 28;
+    if ((head & 1u) || cc != CC_NOERR) {
+        p->ed->head = head & ~3ul; /* not halted, DATA0 */
+        intr_arm(p);
+        return cc == CC_STALL ? -USB_STALL : -USB_ERROR;
+    }
+    cbp = p->td[0].cbp;
+    *actual = (oa_u16)(cbp == 0u ? p->len : cbp - (oa_u32)p->buf_bus);
+    memcpy(buf, p->buf, *actual);
+    intr_arm(p);
+    return 1;
+}
+
 static const struct usb_hc_ops ohci_ops = {
-    o_ports, o_port_reset, o_address, 0, 0, o_control, o_transfer, o_clear_halt, 0
+    o_ports, o_port_reset, o_address, 0, 0, o_control, o_transfer, o_clear_halt, 0,
+    o_intr_open, o_intr_poll
 };
 
 static void hex(char *out, oa_u32 v, unsigned digits)
@@ -396,6 +489,7 @@ int usb_add_ohci(oa_u32 pci)
         return -1;
     }
     memset(hcca, 0, 256);
+    o->hcca = hcca;
     wr(o, HC_HCCA, (oa_u32)hcca_bus);
     wr(o, HC_CTRLHEAD, 0);
     wr(o, HC_BULKHEAD, 0);

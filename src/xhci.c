@@ -120,7 +120,25 @@ struct xhc {
     oa_u64 bounce_bus;
     struct slot slots[MAX_SLOTS + 1];
     oa_u32 last_event[4];
+    struct xintr *intrs;
 };
+
+/* An interrupt IN pipe: one Normal TRB kept queued on the endpoint ring. */
+struct xintr {
+    struct xhc *x;
+    struct slot *s;
+    unsigned dci;
+    oa_u8 *buf;
+    oa_u64 bus, trb;
+    oa_u16 len;
+    int done;
+    oa_u32 cc, residual;
+    struct xintr *next;
+};
+
+#define MAX_INTR 16
+static struct xintr xintrs[MAX_INTR];
+static unsigned nxintrs;
 
 static struct xhc xhcs[MAX_CONTROLLERS];
 static unsigned nxhcs;
@@ -234,6 +252,26 @@ static int next_event(struct xhc *x, oa_u32 ev[4], oa_u64 end)
     return 0;
 }
 
+/* A transfer event for a queued interrupt pipe: note it there. */
+static int intr_event(struct xhc *x, const oa_u32 ev[4])
+{
+    struct xintr *p;
+    oa_u64 at = (oa_u64)ev[0] | ((oa_u64)ev[1] << 32);
+
+    if (((ev[3] >> 10) & 0x3Fu) != TRB_EV_TRANSFER) {
+        return 0;
+    }
+    for (p = x->intrs; p; p = p->next) {
+        if (!p->done && p->trb == at) {
+            p->done = 1;
+            p->cc = ev[2] >> 24;
+            p->residual = ev[2] & 0xFFFFFFu;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* Wait for the event about the TRB at `trb` (command or transfer). Returns
  * the completion code, 0 on timeout; *ev gets the event. */
 static oa_u32 wait_event(struct xhc *x, oa_u32 type, oa_u64 trb, oa_u32 ms, oa_u32 ev[4])
@@ -243,6 +281,9 @@ static oa_u32 wait_event(struct xhc *x, oa_u32 type, oa_u64 trb, oa_u32 ms, oa_u
     for (;;) {
         if (next_event(x, ev, end) < 0) {
             return 0;
+        }
+        if (intr_event(x, ev)) {
+            continue;
         }
         if (((ev[3] >> 10) & 0x3Fu) != type) {
             continue; /* port status changes and the like */
@@ -627,9 +668,69 @@ static void x_clear_halt(struct usb_hc *hc, struct usb_dev *d, oa_u8 ep)
     }
 }
 
+static void intr_arm(struct xintr *p)
+{
+    p->done = 0;
+    p->trb = ring_put(&p->s->ep[p->dci], RING_TRBS, (oa_u32)p->bus, (oa_u32)(p->bus >> 32), p->len,
+                      (TRB_NORMAL << 10) | TRB_ISP | TRB_IOC);
+    oa_host_mb();
+    wr(p->x->db, 4u * p->s->id, p->dci);
+}
+
+static int x_intr_open(struct usb_hc *hc, struct usb_intr *pipe)
+{
+    struct xhc *x = hc->priv;
+    struct slot *s = slot_of(pipe->dev);
+    struct xintr *p;
+    unsigned dci = 2u * (pipe->ep & 15u) + 1u;
+
+    if (nxintrs == MAX_INTR || s == 0 || s->ep[dci].trb == 0) {
+        return -1;
+    }
+    p = &xintrs[nxintrs];
+    p->buf = oa_host_dma_alloc(1024, 64, !x->ac64, &p->bus);
+    if (p->buf == 0) {
+        return -1;
+    }
+    nxintrs++;
+    p->x = x;
+    p->s = s;
+    p->dci = dci;
+    p->len = pipe->len;
+    p->next = x->intrs;
+    x->intrs = p;
+    pipe->hcpriv = p;
+    intr_arm(p);
+    return 0;
+}
+
+static int x_intr_poll(struct usb_hc *hc, struct usb_intr *pipe, void *buf, oa_u16 *actual)
+{
+    struct xhc *x = hc->priv;
+    struct xintr *p = pipe->hcpriv;
+    oa_u32 ev[4];
+
+    while (!p->done && next_event(x, ev, 0) == 0) {
+        intr_event(x, ev); /* nobody else is waiting now */
+    }
+    if (!p->done) {
+        return 0;
+    }
+    if (p->cc != CC_SUCCESS && p->cc != CC_SHORT) {
+        oa_u32 cc = p->cc;
+        reset_ep(x, p->s, p->dci);
+        intr_arm(p);
+        return -result(cc);
+    }
+    *actual = (oa_u16)(p->residual < p->len ? p->len - p->residual : 0u);
+    memcpy(buf, p->buf, *actual);
+    intr_arm(p);
+    return 1;
+}
+
 static const struct usb_hc_ops xhci_ops = {
     x_ports, x_port_reset, x_address, x_update_ep0, x_configure,
-    x_control, x_transfer, x_clear_halt, x_release
+    x_control, x_transfer, x_clear_halt, x_release, x_intr_open, x_intr_poll
 };
 
 /* --- bring-up ------------------------------------------------------------ */
