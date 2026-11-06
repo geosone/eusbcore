@@ -35,6 +35,8 @@
 #define CMD_RESET 0x02u
 #define CMD_PSE   0x10u
 #define CMD_ASE   0x20u
+#define CMD_IAAD  0x40u
+#define STS_IAA   0x20u
 #define STS_HALT  0x1000u
 #define STS_ASS   0x8000u
 
@@ -222,6 +224,37 @@ update:
     return p;
 }
 
+/* Takes a queue head out of the async ring while the controller may still
+ * work on it (a timed-out transfer): unlink it, ring the Interrupt on Async
+ * Advance doorbell and wait until the controller has let go of it (EHCI
+ * 1.0, 4.8.2), clear the overlay, link it in again after the head. */
+static void quiesce(struct ehc *e, struct pipe *p)
+{
+    oa_u32 me = (oa_u32)p->qh_bus | 2u;
+    volatile struct qh *prev = e->head;
+    unsigned i;
+
+    for (i = 0; i < e->npipes && prev->link != me; i++) {
+        prev = e->pipes[i].qh;
+    }
+    if (prev->link != me) {
+        return; /* not linked */
+    }
+    prev->link = p->qh->link;
+    oa_host_mb();
+    wr(e, OP_USBSTS, STS_IAA);
+    wr(e, OP_USBCMD, rd(e, OP_USBCMD) | CMD_IAAD);
+    wait_bits(e, OP_USBSTS, STS_IAA, STS_IAA, 20);
+    wr(e, OP_USBSTS, STS_IAA);
+    p->qh->next = 1u;
+    p->qh->token = p->qh->token & (1ul << 31); /* idle, keep the toggle */
+    p->qh->cur = 0;
+    p->qh->link = e->head->link;
+    oa_host_mb();
+    e->head->link = me;
+    oa_host_mb();
+}
+
 /* Run the qTD chain td[0..n-1] on the pipe. Done when every qTD is
  * inactive, or when one ended short and the next is still active (the
  * controller left the chain through the alternate link). */
@@ -262,16 +295,19 @@ done:
     oa_host_mb();
     return USB_OK;
 error:
-    p->qh->next = 1u;
-    p->qh->token = 0;
-    oa_host_mb();
     if (i >= n) {
         i = n - 1u;
     }
     tok = e->td[i].token;
     if (tok & TOK_ACTIVE) {
+        /* timed out: the controller may still be on it */
+        quiesce(e, p);
         return USB_TIMEOUT;
     }
+    /* halted: the controller leaves the queue head alone */
+    p->qh->next = 1u;
+    p->qh->token = 0;
+    oa_host_mb();
     if ((tok & TOK_HALTED) && !(tok & 0x3Cu)) {
         return USB_STALL;
     }
