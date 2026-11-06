@@ -70,6 +70,7 @@
 #define TRB_CONFIGURE   12u
 #define TRB_EVALUATE    13u
 #define TRB_RESET_EP    14u
+#define TRB_STOP_EP     15u
 #define TRB_SET_DEQ     16u
 #define TRB_EV_TRANSFER 32u
 #define TRB_EV_COMMAND  33u
@@ -547,12 +548,15 @@ static void x_release(struct usb_hc *hc, struct usb_dev *d)
     }
 }
 
-/* Reset a halted endpoint and point it at a fresh ring. */
+/* Point an endpoint at a fresh ring. Set TR Dequeue needs it stopped:
+ * Reset Endpoint stops a halted one (a stall, an error), Stop Endpoint a
+ * running one (a timeout); each fails harmlessly in the other state. */
 static void reset_ep(struct xhc *x, struct slot *s, unsigned dci)
 {
     struct ring *r = &s->ep[dci];
 
     command(x, 0, 0, (TRB_RESET_EP << 10) | ((oa_u32)dci << 16) | ((oa_u32)s->id << 24), 0);
+    command(x, 0, 0, (TRB_STOP_EP << 10) | ((oa_u32)dci << 16) | ((oa_u32)s->id << 24), 0);
     ring_init(x, r, RING_TRBS);
     oa_host_mb();
     command(x, (oa_u32)r->bus | 1u, (oa_u32)(r->bus >> 32),

@@ -16,8 +16,9 @@
 
 #define MAX_CONTROLLERS 4
 #define MAX_ED          64
-#define NTD             4u
+#define NRING           8u   /* TDs per pipe: up to 3 per transfer and the dummy */
 #define PAGE            4096u
+#define OUT_PACKETS     16u  /* see o_transfer */
 
 #define HC_CONTROL   0x04u
 #define HC_CMDSTATUS 0x08u
@@ -68,19 +69,24 @@ struct td {
     oa_u32 info, cbp, next, be;
 };
 
+/* The ED's tail is always a dummy TD of the pipe's ring. A transfer fills
+ * the dummy and the TDs after it and hands them over by moving the tail;
+ * the controller owns the head (OHCI 1.0a, 5.2.8), the driver writes it
+ * only while the ED is halted or skipped. */
 struct pipe {
     struct usb_dev *dev;
     oa_u8 ep;
     volatile struct ed *ed;
     oa_u64 ed_bus;
+    volatile struct td *td;     /* NRING */
+    oa_u64 td_bus;
+    unsigned cur;               /* the dummy: where the next transfer starts */
 };
 
 struct ohc {
     struct usb_hc hc;
     volatile oa_u8 *regs;
     unsigned nports;
-    volatile struct td *td;     /* NTD + 1 (the tail) */
-    oa_u64 td_bus;
     oa_u8 *bounce;
     oa_u64 bounce_bus;
     struct pipe pipes[MAX_ED];
@@ -173,13 +179,16 @@ static struct pipe *pipe_of(struct ohc *o, struct usb_dev *d, oa_u8 ep)
     }
     p = &o->pipes[o->npipes];
     p->ed = oa_host_dma_alloc(16, 16, 1, &p->ed_bus);
-    if (p->ed == 0) {
+    p->td = oa_host_dma_alloc(16u * NRING, 16, 1, &p->td_bus);
+    if (p->ed == 0 || p->td == 0) {
         return 0;
     }
     o->npipes++;
     p->dev = d;
     p->ep = ep;
-    p->ed->tail = p->ed->head = 0;
+    p->cur = 0;
+    memset((void *)p->td, 0, 16u * NRING);
+    p->ed->tail = p->ed->head = (oa_u32)p->td_bus; /* empty: head == tail */
     p->ed->next = 0;
     oa_host_mb();
     /* append to the control or bulk list */
@@ -201,14 +210,27 @@ static struct pipe *pipe_of(struct ohc *o, struct usb_dev *d, oa_u8 ep)
 update:
     mps = control ? d->out[0].mps : (ep & 0x80u) ? d->in[ep & 15u].mps : d->out[ep & 15u].mps;
     /* direction from the TD; skip while idle is not needed (head == tail) */
-    p->ed->info = d->addr | ((oa_u32)(ep & 15u) << 7) |
-                  (d->speed == USB_SPEED_LOW ? (1ul << 13) : 0u) | ((oa_u32)mps << 16);
+    {
+        /* only when it changes (the address after SET_ADDRESS, the packet
+         * size): the controller reads it */
+        oa_u32 info = d->addr | ((oa_u32)(ep & 15u) << 7) |
+                      (d->speed == USB_SPEED_LOW ? (1ul << 13) : 0u) | ((oa_u32)mps << 16);
+        if ((p->ed->info & ~(1ul << 14)) != info) {
+            p->ed->info = info;
+        }
+    }
     return p;
 }
 
-static void fill(struct ohc *o, unsigned i, oa_u32 pid, oa_u64 bus, oa_u32 len, oa_u32 toggle)
+static unsigned ring(const struct pipe *p, unsigned k)
 {
-    volatile struct td *t = &o->td[i];
+    return (p->cur + k) % NRING;
+}
+
+/* TD k of the transfer (k = 0: the current dummy) */
+static void fill(struct pipe *p, unsigned k, oa_u32 pid, oa_u64 bus, oa_u32 len, oa_u32 toggle)
+{
+    volatile struct td *t = &p->td[ring(p, k)];
 
     /* rounding (short packets are fine), no interrupt, toggle from the TD
      * (toggle < 2) or the ED (toggle == 2) */
@@ -216,69 +238,77 @@ static void fill(struct ohc *o, unsigned i, oa_u32 pid, oa_u64 bus, oa_u32 len, 
               (toggle < 2u ? ((2ul | toggle) << 24) : 0u) | ((oa_u32)CC_NOTACCESSED << 28);
     t->cbp = len ? (oa_u32)bus : 0u;
     t->be = len ? (oa_u32)(bus + len - 1u) : 0u;
-    t->next = (oa_u32)(o->td_bus + 16u * (i + 1u));
+    t->next = (oa_u32)(p->td_bus + 16u * ring(p, k + 1u));
 }
 
-/* Hang td[0..n-1] (and the dummy tail td[n]) into the ED and poll. */
+/* Hands TDs 0..n-1 (filled from the dummy on) over by moving the tail to
+ * a new dummy, and polls. */
 static int run(struct ohc *o, struct pipe *p, unsigned n, int control, oa_u32 timeout_ms)
 {
     oa_u64 end = oa_host_time_us() + (oa_u64)timeout_ms * 1000u;
-    oa_u64 tail = o->td_bus + 16u * n;
-    oa_u32 cc, carry = p->ed->head & 2u;
-    unsigned i;
+    volatile struct td *dummy = &p->td[ring(p, n)];
+    oa_u32 tail = (oa_u32)(p->td_bus + 16u * ring(p, n));
+    oa_u32 cc;
+    unsigned i, first = p->cur;
 
-    o->td[n].info = o->td[n].cbp = o->td[n].next = o->td[n].be = 0;
-    p->ed->tail = (oa_u32)tail;
+    dummy->info = dummy->cbp = dummy->next = dummy->be = 0;
     oa_host_mb();
-    p->ed->head = (oa_u32)o->td_bus | carry;
+    p->ed->tail = tail;
     oa_host_mb();
     wr(o, HC_CMDSTATUS, control ? CS_CLF : CS_BLF);
+    p->cur = ring(p, n);
     for (;;) {
-        if ((p->ed->head & ~0xFul) == (oa_u32)tail) {
+        oa_u32 head = p->ed->head;
+        if ((head & ~0xFul) == tail) {
             break;
         }
-        if (p->ed->head & 1u) { /* halted */
+        if (head & 1u) { /* halted */
             break;
         }
         if (oa_host_time_us() > end) {
-            p->ed->info |= 1ul << 14; /* skip */
+            /* skip it, wait a frame, then the head may be moved */
+            p->ed->info |= 1ul << 14;
             oa_host_delay_us(2000);
-            p->ed->head = (oa_u32)tail;
+            p->ed->head = tail | (p->ed->head & 2u);
+            oa_host_mb();
             p->ed->info &= ~(1ul << 14);
             return USB_TIMEOUT;
         }
     }
     oa_host_mb();
     for (i = 0; i < n; i++) {
-        cc = o->td[i].info >> 28;
+        cc = p->td[(first + i) % NRING].info >> 28;
         if (cc == CC_NOERR) {
             continue;
         }
         if (cc >= 0xEu) {
             break; /* not reached: an earlier TD ended it */
         }
-        /* error: clear the halt, keep the toggle carry */
-        p->ed->head = (oa_u32)tail | (p->ed->head & 2u);
+        /* error: the ED is halted; move the head past the rest, keep the
+         * toggle carry, clear the halt */
+        p->ed->head = tail | (p->ed->head & 2u);
         return cc == CC_STALL ? USB_STALL : USB_ERROR;
     }
     if (p->ed->head & 1u) {
-        p->ed->head = (oa_u32)tail | (p->ed->head & 2u);
+        p->ed->head = tail | (p->ed->head & 2u);
         return USB_ERROR;
     }
     return USB_OK;
 }
 
-static oa_u32 td_bytes(struct ohc *o, unsigned i, oa_u32 len)
+/* bytes moved by TD k of the transfer that started at first */
+static oa_u32 td_bytes(struct pipe *p, unsigned first, unsigned k, oa_u32 len)
 {
-    oa_u32 cbp = o->td[i].cbp;
+    volatile struct td *t = &p->td[(first + k) % NRING];
+    oa_u32 cbp = t->cbp;
 
-    if ((o->td[i].info >> 28) != CC_NOERR) {
+    if ((t->info >> 28) != CC_NOERR) {
         return 0;
     }
     if (cbp == 0u) {
         return len; /* all of it */
     }
-    return len - (o->td[i].be - cbp + 1u);
+    return len - (t->be - cbp + 1u);
 }
 
 static int o_control(struct usb_hc *hc, struct usb_dev *d, const oa_u8 setup[8], void *data,
@@ -287,7 +317,7 @@ static int o_control(struct usb_hc *hc, struct usb_dev *d, const oa_u8 setup[8],
     struct ohc *o = hc->priv;
     struct pipe *p = pipe_of(o, d, 0);
     int in = (setup[0] & 0x80u) != 0, r;
-    unsigned n = 0;
+    unsigned n = 0, first;
 
     *actual = 0;
     if (p == 0 || len > PAGE - 64u) {
@@ -297,17 +327,18 @@ static int o_control(struct usb_hc *hc, struct usb_dev *d, const oa_u8 setup[8],
     if (!in && len) {
         memcpy(o->bounce + 64, data, len);
     }
-    fill(o, n++, TD_SETUP, o->bounce_bus, 8, 0);
+    first = p->cur;
+    fill(p, n++, TD_SETUP, o->bounce_bus, 8, 0);
     if (len) {
-        fill(o, n++, in ? TD_IN : TD_OUT, o->bounce_bus + 64u, len, 1);
+        fill(p, n++, in ? TD_IN : TD_OUT, o->bounce_bus + 64u, len, 1);
     }
-    fill(o, n++, (len && in) ? TD_OUT : TD_IN, 0, 0, 1);
+    fill(p, n++, (len && in) ? TD_OUT : TD_IN, 0, 0, 1);
     r = run(o, p, n, 1, timeout_ms ? timeout_ms : 5000u);
     if (r != USB_OK) {
         return r;
     }
     if (len) {
-        *actual = (oa_u16)td_bytes(o, 1, len);
+        *actual = (oa_u16)td_bytes(p, first, 1, len);
         if (in && *actual) {
             memcpy(data, o->bounce + 64, *actual);
         }
@@ -321,23 +352,41 @@ static int o_transfer(struct usb_hc *hc, struct usb_dev *d, oa_u8 ep, void *data
     struct ohc *o = hc->priv;
     struct pipe *p = pipe_of(o, d, ep);
     int in = (ep & 0x80u) != 0, r;
+    unsigned first;
 
     *actual = 0;
     if (p == 0 || len > PAGE) {
         return USB_ERROR;
     }
-    if (!in && len) {
-        memcpy(o->bounce, data, len);
-    }
-    fill(o, 0, in ? TD_IN : TD_OUT, o->bounce_bus, len, 2); /* toggle carried by the ED */
-    r = run(o, p, 1, 0, timeout_ms ? timeout_ms : 15000u);
-    if (r == USB_OK) {
-        *actual = td_bytes(o, 0, len);
-        if (in && *actual) {
+    if (in) {
+        first = p->cur;
+        fill(p, 0, TD_IN, o->bounce_bus, len, 2); /* toggle carried by the ED */
+        r = run(o, p, 1, 0, timeout_ms ? timeout_ms : 15000u);
+        if (r == USB_OK) {
+            *actual = td_bytes(p, first, 0, len);
             memcpy(data, o->bounce, *actual);
         }
+        return r;
     }
-    return r;
+    /* OUT in TDs of at most OUT_PACKETS packets: QEMU 10.0.13's OHCI counts
+     * every packet of an ED in a frame and gives up (unrecoverable error)
+     * after 33; the IN side moves a TD in one go. */
+    memcpy(o->bounce, data, len);
+    {
+        oa_u32 mps = (p->ed->info >> 16) & 0x7FFu, chunk = OUT_PACKETS * (mps ? mps : 8u), off = 0, n;
+        do {
+            n = len - off < chunk ? len - off : chunk;
+            first = p->cur;
+            fill(p, 0, TD_OUT, o->bounce_bus + off, n, 2);
+            r = run(o, p, 1, 0, timeout_ms ? timeout_ms : 15000u);
+            if (r != USB_OK) {
+                return r;
+            }
+            off += td_bytes(p, first, 0, n);
+        } while (off < len);
+        *actual = off;
+    }
+    return USB_OK;
 }
 
 static void o_clear_halt(struct usb_hc *hc, struct usb_dev *d, oa_u8 ep)
@@ -483,9 +532,8 @@ int usb_add_ohci(oa_u32 pci)
     wr(o, HC_PERIODICSTART, (fi & 0x3FFFu) * 9u / 10u);
 
     hcca = oa_host_dma_alloc(256, 256, 1, &hcca_bus);
-    o->td = oa_host_dma_alloc(16u * (NTD + 1u), 16, 1, &o->td_bus);
     o->bounce = oa_host_dma_alloc(PAGE, PAGE, 1, &o->bounce_bus);
-    if (hcca == 0 || o->td == 0 || o->bounce == 0) {
+    if (hcca == 0 || o->bounce == 0) {
         return -1;
     }
     memset(hcca, 0, 256);
