@@ -23,7 +23,10 @@
 #define HC_CONTROL   0x04u
 #define HC_CMDSTATUS 0x08u
 #define HC_INTSTATUS 0x0Cu
+#define HC_INTEN     0x10u
 #define HC_INTDIS    0x14u
+#define INT_WDH      0x00000002u /* WritebackDoneHead: a TD completed */
+#define INT_MIE      0x80000000u /* MasterInterruptEnable */
 #define HC_HCCA      0x18u
 #define HC_CTRLHEAD  0x20u
 #define HC_CTRLCUR   0x24u
@@ -93,6 +96,7 @@ struct ohc {
     unsigned npipes;
     volatile struct ed *ctrl_last, *bulk_last;
     volatile oa_u32 *hcca;      /* interrupt table: entries 0-31 */
+    oa_host_event *ev;          /* completion INTx event, NULL = polled */
 };
 
 /* An interrupt IN pipe: an ED in all 32 interrupt lists (polled in every
@@ -243,6 +247,27 @@ static void fill(struct pipe *p, unsigned k, oa_u32 pid, oa_u64 bus, oa_u32 len,
 
 /* Hands TDs 0..n-1 (filled from the dummy on) over by moving the tail to
  * a new dummy, and polls. */
+static volatile int ohci_irq_seen;  /* an OHCI interrupt was delivered + handled */
+static int ohci_irq_logged;
+
+/* INTx handler: shared and level-triggered. Only WritebackDoneHead is enabled,
+ * so any interrupt that reaches us is a completion; acknowledge it (RW1C, which
+ * de-asserts the level line) and wake the waiter. */
+static void ohci_irq(void *arg)
+{
+    struct ohc *o = arg;
+    oa_u32 sts = rd(o, HC_INTSTATUS) & INT_WDH;
+
+    if (!sts) {
+        return;
+    }
+    wr(o, HC_INTSTATUS, sts);
+    ohci_irq_seen = 1;
+    if (o->ev) {
+        oa_host_event_signal(o->ev);
+    }
+}
+
 static int run(struct ohc *o, struct pipe *p, unsigned n, int control, oa_u32 timeout_ms)
 {
     oa_u64 end = oa_host_time_us() + (oa_u64)timeout_ms * 1000u;
@@ -252,6 +277,11 @@ static int run(struct ohc *o, struct pipe *p, unsigned n, int control, oa_u32 ti
     unsigned i, first = p->cur;
 
     dummy->info = dummy->cbp = dummy->next = dummy->be = 0;
+    /* Interrupt-driven: the last TD's DelayInterrupt field (bits 23:21) goes to
+     * 0 so completion raises WritebackDoneHead; the others keep 7 (no IRQ). */
+    if (o->ev && n > 0u) {
+        p->td[(first + n - 1u) % NRING].info &= ~(7ul << 21);
+    }
     oa_host_mb();
     p->ed->tail = tail;
     oa_host_mb();
@@ -264,6 +294,15 @@ static int run(struct ohc *o, struct pipe *p, unsigned n, int control, oa_u32 ti
         }
         if (head & 1u) { /* halted */
             break;
+        }
+        /* Block for the completion IRQ (poll-first: the ED head is in memory,
+         * the interrupt just wakes us). A polled controller spins. */
+        if (o->ev) {
+            oa_host_event_wait(o->ev, 10u);
+            if (ohci_irq_seen && !ohci_irq_logged) {
+                ohci_irq_logged = 1;
+                oa_host_log(OA_LOG_INFO, "OHCI: interrupt-driven completion\n");
+            }
         }
         if (oa_host_time_us() > end) {
             /* skip it, wait a frame, then the head may be moved */
@@ -545,6 +584,18 @@ int usb_add_ohci(oa_u32 pci)
     wr(o, HC_BULKCUR, 0);
     wr(o, HC_INTSTATUS, 0xFFFFFFFFul);
     wr(o, HC_CONTROL, CTL_OPER | CTL_CLE | CTL_BLE | 3u); /* control:bulk 4:1 */
+
+    /* Interrupt-driven completion over legacy INTx (OHCI has no MSI): bind the
+     * line via the ACPI _PRT and enable WritebackDoneHead. On any failure ev
+     * stays NULL and the done queue is polled -- no regression. */
+    o->ev = oa_host_event_create();
+    if (o->ev && oa_host_pci_intx(pci, ohci_irq, o) >= 0) {
+        wr(o, HC_INTSTATUS, INT_WDH);         /* clear stale */
+        wr(o, HC_INTEN, INT_WDH | INT_MIE);   /* arm completion interrupts */
+    } else if (o->ev) {
+        oa_host_event_destroy(o->ev);
+        o->ev = 0;
+    }
 
     desca = rd(o, HC_RHDESCA);
     o->nports = desca & 0xFFu;

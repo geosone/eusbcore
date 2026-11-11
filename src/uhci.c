@@ -46,6 +46,11 @@
 #define TD_ERRORS  (0x7Eul << 16) /* stalled, buffer, babble, NAK, CRC, bitstuff */
 #define TD_LS      (1ul << 26)
 #define TD_SPD     (1ul << 29)
+#define TD_IOC     (1ul << 24)    /* interrupt on completion */
+#define STS_INT    0x0001u        /* USBSTS: a TD with IOC retired */
+#define STS_ERR    0x0002u        /* USBSTS: USB error interrupt */
+#define INTR_TMO   0x0001u        /* USBINTR: timeout/CRC enable */
+#define INTR_IOC   0x0004u        /* USBINTR: interrupt-on-completion enable */
 #define PID_IN    0x69u
 #define PID_OUT   0xE1u
 #define PID_SETUP 0x2Du
@@ -64,6 +69,7 @@ struct uhc {
     oa_u8 *bounce;
     oa_u64 bounce_bus;
     oa_u32 *frames;
+    oa_host_event *ev;      /* completion INTx event, NULL = polled */
 };
 
 /* An interrupt IN pipe: a queue head in every frame, in front of the
@@ -159,6 +165,27 @@ static void fill(struct uhc *u, const struct usb_dev *d, unsigned i, oa_u8 pid, 
     t->buf = (oa_u32)bus;
 }
 
+static volatile int uhci_irq_seen;  /* a UHCI interrupt was delivered + handled */
+static int uhci_irq_logged;
+
+/* INTx handler: shared and level-triggered. Acknowledge our USBSTS bits (RW1C,
+ * which de-asserts the level line) and wake the waiter; ignore an interrupt
+ * with none of our bits set (another device on the shared line). */
+static void uhci_irq(void *arg)
+{
+    struct uhc *u = arg;
+    oa_u16 sts = inw(u, R_STS) & (STS_INT | STS_ERR);
+
+    if (!sts) {
+        return;
+    }
+    outw(u, R_STS, sts);
+    uhci_irq_seen = 1;
+    if (u->ev) {
+        oa_host_event_signal(u->ev);
+    }
+}
+
 /* Run td[0..n-1]; *done gets the number of TDs completed, *bytes their
  * data. Stops at a short packet. */
 static int run(struct uhc *u, unsigned n, oa_u32 timeout_ms, unsigned *done, oa_u32 *bytes)
@@ -169,6 +196,11 @@ static int run(struct uhc *u, unsigned n, oa_u32 timeout_ms, unsigned *done, oa_
     int r = USB_OK;
 
     u->td[n - 1u].link = 1u;
+    /* Interrupt-driven: the last TD raises USBINT on completion so the waiter
+     * can block instead of spinning. Harmless when polled (nothing reads it). */
+    if (u->ev) {
+        u->td[n - 1u].cs |= TD_IOC;
+    }
     oa_host_mb();
     u->qh[1] = (oa_u32)u->td_bus;
     *done = 0;
@@ -193,6 +225,15 @@ static int run(struct uhc *u, unsigned n, oa_u32 timeout_ms, unsigned *done, oa_
         }
         if (*done == n) {
             break;
+        }
+        /* Block for the completion IRQ (poll-first: the TD status is in memory,
+         * the interrupt just wakes us). A polled controller spins. */
+        if (u->ev) {
+            oa_host_event_wait(u->ev, 10u);
+            if (uhci_irq_seen && !uhci_irq_logged) {
+                uhci_irq_logged = 1;
+                oa_host_log(OA_LOG_INFO, "UHCI: interrupt-driven completion\n");
+            }
         }
         if (oa_host_time_us() > end) {
             r = USB_TIMEOUT;
@@ -429,6 +470,18 @@ int usb_add_uhci(oa_u32 pci)
     outw(u, R_STS, 0xFFFFu);
     outw(u, R_CMD, CMD_RS | CMD_CF | CMD_MAXP);
     oa_host_delay_us(100000);
+
+    /* Interrupt-driven completion over legacy INTx (UHCI has no MSI): bind the
+     * line via the ACPI _PRT and enable IOC/error. On any failure ev stays NULL
+     * and the frame list is polled -- no regression. */
+    u->ev = oa_host_event_create();
+    if (u->ev && oa_host_pci_intx(pci, uhci_irq, u) >= 0) {
+        outw(u, R_STS, STS_INT | STS_ERR);    /* clear stale */
+        outw(u, R_INTR, INTR_IOC | INTR_TMO); /* arm completion + error */
+    } else if (u->ev) {
+        oa_host_event_destroy(u->ev);
+        u->ev = 0;
+    }
 
     memcpy(u->hc.name, "UHCI 0000:00:00.0", 18);
     hex(u->hc.name + 5, pci >> 16, 4);
