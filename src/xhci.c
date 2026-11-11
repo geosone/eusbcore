@@ -39,12 +39,14 @@
 #define OP_PORTSC    0x400u
 /* interrupter 0 */
 #define IR_IMAN      0x20u
+#define IR_IMOD      0x24u
 #define IR_ERSTSZ    0x28u
 #define IR_ERSTBA    0x30u
 #define IR_ERDP      0x38u
 
 #define CMD_RS    0x01u
 #define CMD_HCRST 0x02u
+#define CMD_INTE  0x04u /* interrupter enable (host system interrupt enable) */
 #define STS_HCH   0x01u
 #define STS_CNR   0x800u
 
@@ -122,6 +124,7 @@ struct xhc {
     struct slot slots[MAX_SLOTS + 1];
     oa_u32 last_event[4];
     struct xintr *intrs;
+    oa_host_event *ev;   /* event-ring MSI-X event, NULL = poll */
 };
 
 /* An interrupt IN pipe: one Normal TRB kept queued on the endpoint ring. */
@@ -224,20 +227,32 @@ static oa_u64 ring_put(struct ring *r, unsigned ntrbs, oa_u32 p0, oa_u32 p1, oa_
     return addr;
 }
 
-/* Next event, or -1 when none arrives in time. */
-static int next_event(struct xhc *x, oa_u32 ev[4], oa_u64 end)
+/* Interrupter 0's MSI-X. An event posted to the ring sets IMAN.IP and raises
+ * the interrupt; clear IP (RW1C, keeping IE) and wake whoever waits on the
+ * event ring -- the cycle bit is the real condition, this is only a wakeup. */
+static volatile int xhci_irq_seen;  /* an xHCI interrupt was delivered + handled */
+static int xhci_irq_logged;
+static void xhci_irq(void *arg)
 {
-    volatile struct trb *t;
+    struct xhc *x = arg;
+    /* MSI-X is a dedicated edge vector, so every interrupt here is ours -- don't
+     * gate on IMAN.IP, which QEMU clears when it sends the message (so it already
+     * reads 0 by the time we run). Clear it anyway (keeping IE) and wake the
+     * waiter; the event ring's cycle bit is the real completion condition. */
+    wr(x->rt, IR_IMAN, rd(x->rt, IR_IMAN) | 1u);
+    xhci_irq_seen = 1;
+    oa_host_event_signal(x->ev);
+}
+
+/* Consume the next event if one is on the ring: 0 with *ev filled, or -1 when
+ * the ring is empty. Non-blocking -- the caller decides how to wait. */
+static int next_event(struct xhc *x, oa_u32 ev[4])
+{
+    volatile struct trb *t = &x->evt[x->evt_deq];
     oa_u64 deq;
 
-    for (;;) {
-        t = &x->evt[x->evt_deq];
-        if ((t->control & TRB_CYCLE) == x->evt_cycle) {
-            break;
-        }
-        if (oa_host_time_us() > end) {
-            return -1;
-        }
+    if ((t->control & TRB_CYCLE) != x->evt_cycle) {
+        return -1;
     }
     oa_host_mb();
     ev[0] = t->p0;
@@ -273,38 +288,53 @@ static int intr_event(struct xhc *x, const oa_u32 ev[4])
     return 0;
 }
 
-/* Wait for the event about the TRB at `trb` (command or transfer). Returns
- * the completion code, 0 on timeout; *ev gets the event. */
+/* Wait for the event about the TRB at `trb` (command or transfer). Returns the
+ * completion code, 0 on timeout; *ev gets the event. On an interrupt-driven
+ * controller it blocks on the interrupter's event, then drains every event the
+ * handler made available. Blocking *before* touching the ring matters: the xHC
+ * (QEMU's model, and real silicon with interrupt moderation) may raise the
+ * interrupt only once the guest stops hammering the ring, so a poll-first loop
+ * would drain and clear the pending bit before the interrupt ever fires. A
+ * polled controller (no event) just spins. */
 static oa_u32 wait_event(struct xhc *x, oa_u32 type, oa_u64 trb, oa_u32 ms, oa_u32 ev[4])
 {
     oa_u64 end = oa_host_time_us() + (oa_u64)ms * 1000u, at;
 
     for (;;) {
-        if (next_event(x, ev, end) < 0) {
-            return 0;
+        if (x->ev) {
+            oa_host_event_wait(x->ev, 1000u); /* block for the completion IRQ */
+            if (xhci_irq_seen && !xhci_irq_logged) {
+                xhci_irq_logged = 1;
+                oa_host_log(OA_LOG_INFO, "xHCI: interrupt-driven completion\n");
+            }
         }
-        if (intr_event(x, ev)) {
-            continue;
-        }
-        if (((ev[3] >> 10) & 0x3Fu) != type) {
-            continue; /* port status changes and the like */
-        }
-        at = (oa_u64)ev[0] | ((oa_u64)ev[1] << 32);
-        if (type == TRB_EV_TRANSFER && trb == 0u) {
-            return ev[2] >> 24;
-        }
-        if (at == trb) {
-            return ev[2] >> 24;
-        }
-        if (type == TRB_EV_TRANSFER) {
-            /* an earlier TRB of the same transfer (short packet) */
-            x->last_event[0] = ev[0];
-            x->last_event[1] = ev[1];
-            x->last_event[2] = ev[2];
-            x->last_event[3] = ev[3];
-            if ((ev[2] >> 24) != CC_SUCCESS && (ev[2] >> 24) != CC_SHORT) {
+        while (next_event(x, ev) == 0) {
+            if (intr_event(x, ev)) {
+                continue;
+            }
+            if (((ev[3] >> 10) & 0x3Fu) != type) {
+                continue; /* port status changes and the like */
+            }
+            at = (oa_u64)ev[0] | ((oa_u64)ev[1] << 32);
+            if (type == TRB_EV_TRANSFER && trb == 0u) {
                 return ev[2] >> 24;
             }
+            if (at == trb) {
+                return ev[2] >> 24;
+            }
+            if (type == TRB_EV_TRANSFER) {
+                /* an earlier TRB of the same transfer (short packet) */
+                x->last_event[0] = ev[0];
+                x->last_event[1] = ev[1];
+                x->last_event[2] = ev[2];
+                x->last_event[3] = ev[3];
+                if ((ev[2] >> 24) != CC_SUCCESS && (ev[2] >> 24) != CC_SHORT) {
+                    return ev[2] >> 24;
+                }
+            }
+        }
+        if (oa_host_time_us() > end) {
+            return 0;
         }
     }
 }
@@ -714,7 +744,7 @@ static int x_intr_poll(struct usb_hc *hc, struct usb_intr *pipe, void *buf, oa_u
     struct xintr *p = pipe->hcpriv;
     oa_u32 ev[4];
 
-    while (!p->done && next_event(x, ev, 0) == 0) {
+    while (!p->done && next_event(x, ev) == 0) {
         intr_event(x, ev); /* nobody else is waiting now */
     }
     if (!p->done) {
@@ -865,12 +895,24 @@ int usb_add_xhci(oa_u32 pci)
     erst[1] = (oa_u32)(x->evt_bus >> 32);
     erst[2] = EVT_TRBS;
     x->evt_cycle = 1;
-    wr(x->rt, IR_IMAN, 1);      /* clear pending, no interrupts */
+    wr(x->rt, IR_IMAN, 1);      /* clear pending, no interrupts yet */
     wr(x->rt, IR_ERSTSZ, 1);
     wr64(x->rt, IR_ERDP, x->evt_bus);
     wr64(x->rt, IR_ERSTBA, erst_bus);
+    /* Interrupt-driven event ring: bind one MSI-X vector to interrupter 0 and
+     * enable it (IMAN.IE). On any failure ev stays NULL and the ring is polled,
+     * with the interrupter and the host system interrupt (CMD_INTE) left off,
+     * so a controller without working MSI-X never regresses. */
+    x->ev = oa_host_event_create();
+    if (x->ev && oa_host_pci_msix(pci, xhci_irq, x) >= 0) {
+        wr(x->rt, IR_IMOD, 0);    /* no moderation: deliver each event promptly */
+        wr(x->rt, IR_IMAN, 0x3u); /* clear IP (bit0 RW1C) + enable IE (bit1) */
+    } else if (x->ev) {
+        oa_host_event_destroy(x->ev);
+        x->ev = 0;
+    }
     oa_host_mb();
-    wr(x->op, OP_USBCMD, CMD_RS);
+    wr(x->op, OP_USBCMD, x->ev ? (CMD_RS | CMD_INTE) : CMD_RS);
     if (wait_bits(x->op, OP_USBSTS, STS_HCH, 0, 100) < 0) {
         return -1;
     }
