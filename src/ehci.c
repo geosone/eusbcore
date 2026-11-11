@@ -39,6 +39,9 @@
 #define STS_IAA   0x20u
 #define STS_HALT  0x1000u
 #define STS_ASS   0x8000u
+#define STS_INT   0x0001u /* USBINT: a qTD with IOC completed */
+#define STS_ERR   0x0002u /* USBERRINT: a transfer errored */
+#define TD_IOC    0x8000u /* qTD token: interrupt on completion */
 
 #define PORT_CCS   0x0001u
 #define PORT_CSC   0x0002u
@@ -90,6 +93,7 @@ struct ehc {
     struct pipe pipes[MAX_QH];
     unsigned npipes;
     oa_u32 *frames;               /* periodic frame list, 1024 entries */
+    oa_host_event *ev;            /* completion INTx event, NULL = polled */
 };
 
 /* An interrupt IN pipe: a queue head in the periodic schedule (polled in
@@ -255,6 +259,27 @@ static void quiesce(struct ehc *e, struct pipe *p)
     oa_host_mb();
 }
 
+static volatile int ehci_irq_seen;  /* an EHCI interrupt was delivered + handled */
+static int ehci_irq_logged;
+
+/* INTx handler: shared and level-triggered. Acknowledge our USBSTS bits (RW1C,
+ * which de-asserts the level line) and wake the waiter; ignore the interrupt
+ * when none of our bits are set (another device on the shared line). */
+static void ehci_irq(void *arg)
+{
+    struct ehc *e = arg;
+    oa_u32 sts = rd(e, OP_USBSTS) & (STS_INT | STS_ERR);
+
+    if (!sts) {
+        return;
+    }
+    wr(e, OP_USBSTS, sts);
+    ehci_irq_seen = 1;
+    if (e->ev) {
+        oa_host_event_signal(e->ev);
+    }
+}
+
 /* Run the qTD chain td[0..n-1] on the pipe. Done when every qTD is
  * inactive, or when one ended short and the next is still active (the
  * controller left the chain through the alternate link). */
@@ -266,6 +291,11 @@ static int run(struct ehc *e, struct pipe *p, unsigned n, oa_u32 timeout_ms)
 
     p->qh->token = p->qh->token & (1ul << 31); /* overlay idle, keep the toggle */
     p->qh->cur = 0;
+    /* Interrupt-driven: the last qTD raises USBINT on completion so the waiter
+     * can block instead of spinning. Harmless when polled (nothing reads it). */
+    if (n > 0u) {
+        e->td[n - 1u].token |= TD_IOC;
+    }
     oa_host_mb();
     p->qh->next = (oa_u32)e->td_bus;
     oa_host_mb();
@@ -288,6 +318,15 @@ static int run(struct ehc *e, struct pipe *p, unsigned n, oa_u32 timeout_ms)
         }
         if (oa_host_time_us() > end) {
             goto error;
+        }
+        /* Block for the completion IRQ (poll-first: the status above is in
+         * memory, the interrupt just wakes us). A polled controller spins. */
+        if (e->ev) {
+            oa_host_event_wait(e->ev, 10u);
+            if (ehci_irq_seen && !ehci_irq_logged) {
+                ehci_irq_logged = 1;
+                oa_host_log(OA_LOG_INFO, "EHCI: interrupt-driven completion\n");
+            }
         }
     }
 done:
@@ -610,6 +649,18 @@ int usb_add_ehci(oa_u32 pci)
             wr(e, OP_FRINDEX, 0);
             wr(e, OP_PERIODIC, (oa_u32)fb);
         }
+    }
+    /* Interrupt-driven completion over legacy INTx (EHCI has no MSI): bind the
+     * line via the ACPI _PRT and enable USBINT/USBERRINT. On any failure ev
+     * stays NULL and the schedules are polled, so a controller whose line
+     * cannot be routed never regresses. */
+    e->ev = oa_host_event_create();
+    if (e->ev && oa_host_pci_intx(pci, ehci_irq, e) >= 0) {
+        wr(e, OP_USBSTS, STS_INT | STS_ERR);  /* clear stale status */
+        wr(e, OP_USBINTR, STS_INT | STS_ERR); /* arm completion + error */
+    } else if (e->ev) {
+        oa_host_event_destroy(e->ev);
+        e->ev = 0;
     }
     oa_host_mb();
     wr(e, OP_USBCMD, (8ul << 16) | CMD_ASE | (e->frames ? CMD_PSE : 0u) | CMD_RS);
