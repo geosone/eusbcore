@@ -250,6 +250,17 @@ static void fill(struct pipe *p, unsigned k, oa_u32 pid, oa_u64 bus, oa_u32 len,
 static volatile int ohci_irq_seen;  /* an OHCI interrupt was delivered + handled */
 static int ohci_irq_logged;
 
+/* Log once that a completion interrupt was delivered. Checked while waiting AND
+ * when a transfer is done: on a fast host every transfer can already be complete
+ * at the first look, so the wait (and a check only there) is never reached. */
+static void ohci_irq_proof(void)
+{
+    if (ohci_irq_seen && !ohci_irq_logged) {
+        ohci_irq_logged = 1;
+        oa_host_log(OA_LOG_INFO, "OHCI: interrupt-driven completion\n");
+    }
+}
+
 /* INTx handler: shared and level-triggered. Only WritebackDoneHead is enabled,
  * so any interrupt that reaches us is a completion; acknowledge it (RW1C, which
  * de-asserts the level line) and wake the waiter. */
@@ -299,10 +310,7 @@ static int run(struct ohc *o, struct pipe *p, unsigned n, int control, oa_u32 ti
          * the interrupt just wakes us). A polled controller spins. */
         if (o->ev) {
             oa_host_event_wait(o->ev, 10u);
-            if (ohci_irq_seen && !ohci_irq_logged) {
-                ohci_irq_logged = 1;
-                oa_host_log(OA_LOG_INFO, "OHCI: interrupt-driven completion\n");
-            }
+            ohci_irq_proof();
         }
         if (oa_host_time_us() > end) {
             /* skip it, wait a frame, then the head may be moved */
@@ -314,6 +322,7 @@ static int run(struct ohc *o, struct pipe *p, unsigned n, int control, oa_u32 ti
             return USB_TIMEOUT;
         }
     }
+    ohci_irq_proof();
     oa_host_mb();
     for (i = 0; i < n; i++) {
         cc = p->td[(first + i) % NRING].info >> 28;

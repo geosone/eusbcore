@@ -168,6 +168,17 @@ static void fill(struct uhc *u, const struct usb_dev *d, unsigned i, oa_u8 pid, 
 static volatile int uhci_irq_seen;  /* a UHCI interrupt was delivered + handled */
 static int uhci_irq_logged;
 
+/* Log once that a completion interrupt was delivered. Checked while waiting AND
+ * when a transfer is done: on a fast host every transfer can already be complete
+ * at the first look, so the wait (and a check only there) is never reached. */
+static void uhci_irq_proof(void)
+{
+    if (uhci_irq_seen && !uhci_irq_logged) {
+        uhci_irq_logged = 1;
+        oa_host_log(OA_LOG_INFO, "UHCI: interrupt-driven completion\n");
+    }
+}
+
 /* INTx handler: shared and level-triggered. Acknowledge our USBSTS bits (RW1C,
  * which de-asserts the level line) and wake the waiter; ignore an interrupt
  * with none of our bits set (another device on the shared line). */
@@ -230,10 +241,7 @@ static int run(struct uhc *u, unsigned n, oa_u32 timeout_ms, unsigned *done, oa_
          * the interrupt just wakes us). A polled controller spins. */
         if (u->ev) {
             oa_host_event_wait(u->ev, 10u);
-            if (uhci_irq_seen && !uhci_irq_logged) {
-                uhci_irq_logged = 1;
-                oa_host_log(OA_LOG_INFO, "UHCI: interrupt-driven completion\n");
-            }
+            uhci_irq_proof();
         }
         if (oa_host_time_us() > end) {
             r = USB_TIMEOUT;
@@ -241,6 +249,7 @@ static int run(struct uhc *u, unsigned n, oa_u32 timeout_ms, unsigned *done, oa_
         }
     }
 stop:
+    uhci_irq_proof();
     u->qh[1] = 1u; /* out of the schedule */
     oa_host_mb();
     oa_host_delay_us(1000); /* one frame: the controller lets go */

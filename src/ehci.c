@@ -262,6 +262,17 @@ static void quiesce(struct ehc *e, struct pipe *p)
 static volatile int ehci_irq_seen;  /* an EHCI interrupt was delivered + handled */
 static int ehci_irq_logged;
 
+/* Log once that a completion interrupt was delivered. Checked while waiting AND
+ * when a transfer is done: on a fast host every transfer can already be complete
+ * at the first look, so the wait (and a check only there) is never reached. */
+static void ehci_irq_proof(void)
+{
+    if (ehci_irq_seen && !ehci_irq_logged) {
+        ehci_irq_logged = 1;
+        oa_host_log(OA_LOG_INFO, "EHCI: interrupt-driven completion\n");
+    }
+}
+
 /* INTx handler: shared and level-triggered. Acknowledge our USBSTS bits (RW1C,
  * which de-asserts the level line) and wake the waiter; ignore the interrupt
  * when none of our bits are set (another device on the shared line). */
@@ -323,13 +334,11 @@ static int run(struct ehc *e, struct pipe *p, unsigned n, oa_u32 timeout_ms)
          * memory, the interrupt just wakes us). A polled controller spins. */
         if (e->ev) {
             oa_host_event_wait(e->ev, 10u);
-            if (ehci_irq_seen && !ehci_irq_logged) {
-                ehci_irq_logged = 1;
-                oa_host_log(OA_LOG_INFO, "EHCI: interrupt-driven completion\n");
-            }
+            ehci_irq_proof();
         }
     }
 done:
+    ehci_irq_proof();
     p->qh->next = 1u;
     oa_host_mb();
     return USB_OK;
